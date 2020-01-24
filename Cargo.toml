@@ -1,0 +1,9 @@
+[package]
+name = "tbfdump"
+version = "0.1.0"
+authors = ["Adam H. Leventhal <ahl@oxide.computer>"]
+edition = "2018"
+
+[dependencies]
+riscv-disasm = {git = "https://github.com/laanwj/rust-riscv-disasm" }
+pretty-hex = "0.1.1"
