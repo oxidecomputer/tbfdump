@@ -1,5 +1,9 @@
+use std::env;
 use std::fs::File;
+use std::io;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 
 use pretty_hex::*;
 use riscv_disasm::*;
@@ -55,14 +59,6 @@ struct LayoutHeader32 {
     stack_size: u32,
 }
 
-fn read_tbf_header(reader: &mut dyn Read) -> Option<TbfHeaderV2Base> {
-    let mut h = [0u8; std::mem::size_of::<TbfHeaderV2Base>()];
-    match reader.read_exact(&mut h[..]) {
-        Ok(_) => Some(unsafe { std::mem::transmute(h) }),
-        _ => None,
-    }
-}
-
 fn read_tbf_tlv(reader: &mut dyn Read) -> Option<TbfHeaderTlv> {
     let mut h = [0u8; std::mem::size_of::<TbfHeaderTlv>()];
     match reader.read_exact(&mut h[..]) {
@@ -87,10 +83,33 @@ fn read_layout_header32(reader: &mut dyn Read) -> Option<LayoutHeader32> {
     }
 }
 
-fn main() {
-    let mut file = File::open("rv32imac.tbf").expect("foo");
+fn main() -> io::Result<()> {
+    let mut file = File::open(env::args().nth(1).expect("no file specified")).expect("foo");
 
-    let header = read_tbf_header(&mut file).expect("ok");
+    let mut buf = vec![0_u8; 2];
+
+    file.read_exact(&mut buf[0..2]).expect("ok");
+
+    let version = buf[0] as u16 | (buf[1] as u16) << 8;
+
+    file.seek(SeekFrom::Start(0))?;
+
+    match version {
+        2 => tbf_v2(&mut file),
+        _ => panic!("unexpected version"),
+    }
+
+    Ok(())
+}
+
+fn tbf_v2(mut file: &mut dyn Read) {
+    let header_size = std::mem::size_of::<TbfHeaderV2Base>();
+    let mut hb = vec![0_u8; header_size];
+
+    file.read_exact(&mut hb[0..header_size]).expect("ok");
+
+    let (_head, body, _tail) = unsafe { hb.align_to::<TbfHeaderV2Base>() };
+    let header = &body[0];
 
     println!("version          {:x?}", header.version);
     println!("header_size      {:x?}", header.header_size);
@@ -99,32 +118,65 @@ fn main() {
     println!("checksum         {:x?}", header.checksum);
     println!("");
 
-    hh(
-        &mut file,
-        header.header_size as u64 - std::mem::size_of::<TbfHeaderV2Base>() as u64,
-    );
+    let mut padding = 0_u64;
+
+    let mut r =
+        file.take(header.header_size as u64 - std::mem::size_of::<TbfHeaderV2Base>() as u64);
+    loop {
+        match read_tbf_tlv(&mut r) {
+            Some(tlv) => {
+                println!("type             {:x?}", tlv.tipe);
+                println!("length           {:x?}", tlv.length);
+                match tlv.tipe {
+                    TbfHeaderTypes::TbfHeaderMain => {
+                        let h = read_tbf_main(&mut r).expect("ok");
+                        println!("init_fn_offset   {:x?}", h.init_fn_offset);
+                        println!("protected_size   {:x?}", h.protected_size);
+                        println!("minimum_ram_size {:x?}", h.minimum_ram_size);
+
+                        padding = padding + h.protected_size as u64;
+                    }
+                    TbfHeaderTypes::TbfHeaderPackageName => {
+                        let s = ss(&mut r, tlv.length.into());
+                        println!("package name     {}", s);
+                    }
+                    _ => {}
+                }
+                println!("");
+            }
+            None => break, // no more sections
+        }
+    }
+
+    let _header_remnants = r.read_to_end(&mut Vec::new());
+    let _header_padding = file.take(padding).read_to_end(&mut Vec::new());
 
     let layout = read_layout_header32(&mut file).expect("ok");
-    println!("got_sym_start  {:x}", layout.got_sym_start);
-    println!("got_start      {:x}", layout.got_start);
-    println!("got_size       {:x}", layout.got_size);
-    println!("data_sym_start {:x}", layout.data_sym_start);
-    println!("data_start     {:x}", layout.data_start);
-    println!("data_size      {:x}", layout.data_size);
-    println!("bss_start      {:x}", layout.bss_start);
-    println!("bss_size       {:x}", layout.bss_size);
-    println!("reldata_start  {:x}", layout.reldata_start);
-    println!("stack_size     {:x}", layout.stack_size);
+    println!("got_sym_start    {:x}", layout.got_sym_start);
+    println!("got_start        {:x}", layout.got_start);
+    println!("got_size         {:x}", layout.got_size);
+    println!("data_sym_start   {:x}", layout.data_sym_start);
+    println!("data_start       {:x}", layout.data_start);
+    println!("data_size        {:x}", layout.data_size);
+    println!("bss_start        {:x}", layout.bss_start);
+    println!("bss_size         {:x}", layout.bss_size);
+    println!("reldata_start    {:x}", layout.reldata_start);
+    println!("stack_size       {:x}", layout.stack_size);
 
     println!("");
 
+    let layout_size = std::mem::size_of::<LayoutHeader32>() as u64;
+
     let mut buffer = Vec::<u8>::new();
-    (&file)
-        .take(layout.got_sym_start as u64 - std::mem::size_of::<LayoutHeader32>() as u64)
+    file.take(layout.got_sym_start as u64 - layout_size)
         .read_to_end(&mut buffer)
         .expect("read failed");
 
-    for decoded in Disassembler::new(rv_isa::rv32, &buffer, header.header_size as u64) {
+    for decoded in Disassembler::new(
+        rv_isa::rv32,
+        &buffer,
+        layout_size + header.header_size as u64,
+    ) {
         println!("{:08x} {}", decoded.pc, format_inst(32, &decoded));
     }
 
@@ -138,39 +190,4 @@ fn ss(file: &mut dyn Read, len: u64) -> String {
     let mut buf = String::new();
     let _ = r.read_to_string(&mut buf);
     buf
-}
-fn hh(file: &mut dyn Read, size: u64) {
-    let mut r2 = file.take(size);
-
-    let mut i = 0;
-    loop {
-        let tlv = read_tbf_tlv(&mut r2).expect("ok");
-        println!("type             {:x?}", tlv.tipe);
-        println!("length           {:x?}", tlv.length);
-
-        match tlv.tipe {
-            TbfHeaderTypes::TbfHeaderMain => {
-                let h = read_tbf_main(&mut r2).expect("ok");
-                println!("init_fn_offset   {:x?}", h.init_fn_offset);
-                println!("protected_size   {:x?}", h.protected_size);
-                println!("minimum_ram_size {:x?}", h.minimum_ram_size);
-            }
-            TbfHeaderTypes::TbfHeaderPackageName => {
-                let s = ss(&mut r2, tlv.length.into());
-                println!("package name     {}", s);
-            }
-            _ => {}
-        }
-
-        println!("");
-
-        i += 1;
-        if i > 1 {
-            break;
-        }
-    }
-
-    // Burn down any part of the header we didn't consume.
-    let mut buffer = Vec::new();
-    let _ = r2.read_to_end(&mut buffer);
 }
