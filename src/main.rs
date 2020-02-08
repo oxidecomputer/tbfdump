@@ -175,7 +175,7 @@ fn tbf_v2(mut file: &mut dyn Read) {
     for decoded in Disassembler::new(
         rv_isa::rv32,
         &buffer,
-        layout_size + header.header_size as u64,
+        layout_size + header.header_size as u64 + padding,
     ) {
         println!("{:08x} {}", decoded.pc, format_inst(32, &decoded));
     }
